@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sooner-email"
+version = "0.1.0"
+description = "The first-party Python client for the Sooner email API"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{name = "Sooner"}]
+classifiers = ["Programming Language :: Python :: 3", "Typing :: Typed"]
+
+[project.urls]
+Homepage = "https://sooner.dev"
+Documentation = "https://sooner.dev/docs/sdks/python"
+Repository = "https://github.com/Quad-Labs-LLC/sooner-sdks"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sooner_email = ["py.typed"]

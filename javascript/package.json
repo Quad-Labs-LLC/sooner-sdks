@@ -1,0 +1,33 @@
+{
+  "name": "sooner-email",
+  "version": "0.1.0",
+  "description": "Official JavaScript and TypeScript client for the Sooner email API",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://sooner.dev/docs/sdks/node",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Quad-Labs-LLC/sooner-sdks.git",
+    "directory": "javascript"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run build && node --test test/*.test.mjs",
+    "prepack": "pnpm run build"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}
