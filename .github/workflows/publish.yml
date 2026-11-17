@@ -1,0 +1,55 @@
+name: Publish verified SDK artifacts
+on:
+  workflow_dispatch:
+    inputs:
+      registry:
+        required: true
+        type: choice
+        options:
+          - pypi
+          - rubygems
+
+permissions: {}
+
+jobs:
+  pypi:
+    if: github.ref == 'refs/heads/main' && inputs.registry == 'pypi'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download and verify Python 0.1.0
+        shell: bash
+        run: |
+          mkdir dist
+          cd dist
+          release=https://github.com/Quad-Labs-LLC/sooner-sdks/releases/download/v0.1.0
+          curl --fail --silent --show-error --location --proto '=https' --max-time 60 --remote-name "$release/sooner_email-0.1.0-py3-none-any.whl"
+          curl --fail --silent --show-error --location --proto '=https' --max-time 60 --remote-name "$release/sooner_email-0.1.0.tar.gz"
+          sha256sum --check <<'SUMS'
+          8aba96f40de6a4e627b0f8a8f284ba47ea14c86e5ae1413cbb6fc6da543e0b70  sooner_email-0.1.0-py3-none-any.whl
+          ba58b16911369fb12d92b706ed90806c05c78dedbcacf85c396371ff40b27b93  sooner_email-0.1.0.tar.gz
+          SUMS
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          attestations: false
+
+  rubygems:
+    if: github.ref == 'refs/heads/main' && inputs.registry == 'rubygems'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: rubygems
+    permissions:
+      id-token: write
+    steps:
+      - name: Download and verify Ruby 0.1.0
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --max-time 60 --remote-name https://github.com/Quad-Labs-LLC/sooner-sdks/releases/download/v0.1.0/sooner-email-0.1.0.gem
+          sha256sum --check <<'SUMS'
+          4c93cd0e7097395bd70c3854b84c234b240d5d7c7881e478072d4330e255ba6d  sooner-email-0.1.0.gem
+          SUMS
+      - uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+      - run: gem push sooner-email-0.1.0.gem
