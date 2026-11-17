@@ -2,17 +2,17 @@
 
 Typed asynchronous client for the Sooner email API. Requires Rust 1.88 or newer and an async runtime such as Tokio. The SDK uses HTTPS with Rustls and has no native TLS dependency.
 
-Install the tagged release:
+Install from crates.io:
 
 ```sh
-cargo add sooner-email --git https://github.com/Quad-Labs-LLC/sooner-sdks --tag v0.1.0
+cargo add sooner-email@0.1.0
 ```
 
 Add an async runtime to your application:
 
 ```toml
 [dependencies]
-sooner-email = { git = "https://github.com/Quad-Labs-LLC/sooner-sdks", tag = "v0.1.0" }
+sooner-email = "0.1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

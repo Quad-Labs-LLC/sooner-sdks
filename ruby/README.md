@@ -2,11 +2,10 @@
 
 Ruby 3.1 or later. Uses standard and bundled `net/http`, `json`, `uri`, `ipaddr` and `timeout`. Verified locally with Ruby 4.0.
 
-Install the published gem:
+Install from RubyGems:
 
 ```sh
-curl -fLO https://github.com/Quad-Labs-LLC/sooner-sdks/releases/download/v0.1.0/sooner-email-0.1.0.gem
-gem install --local sooner-email-0.1.0.gem
+gem install sooner-email --version 0.1.0
 ```
 
 ```ruby

@@ -3,7 +3,7 @@
 First-party Python client for sending, listing, retrieving, rescheduling, and canceling Sooner emails. Requires Python 3.11 or newer and has no runtime dependencies.
 
 ```sh
-python -m pip install https://github.com/Quad-Labs-LLC/sooner-sdks/releases/download/v0.1.0/sooner_email-0.1.0-py3-none-any.whl
+python -m pip install sooner-email==0.1.0
 ```
 
 ```python

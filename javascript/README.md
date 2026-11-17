@@ -3,7 +3,7 @@
 Use the Sooner email API from Node.js 22 or later. Create an API key in the Sooner dashboard and keep it on your server.
 
 ```sh
-pnpm add https://github.com/Quad-Labs-LLC/sooner-sdks/releases/download/v0.1.0/sooner-email-0.1.0.tgz
+pnpm add sooner-email@0.1.0
 ```
 
 ```ts
