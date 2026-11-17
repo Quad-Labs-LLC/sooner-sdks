@@ -51,5 +51,20 @@ jobs:
           sha256sum --check <<'SUMS'
           4c93cd0e7097395bd70c3854b84c234b240d5d7c7881e478072d4330e255ba6d  sooner-email-0.1.0.gem
           SUMS
-      - uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
-      - run: gem push sooner-email-0.1.0.gem
+      - name: Publish the gem as the configured owner
+        shell: bash
+        env:
+          RUBYGEMS_OWNER_ID: ${{ vars.RUBYGEMS_OWNER_ID }}
+        run: |
+          [[ "$RUBYGEMS_OWNER_ID" =~ ^[0-9]+$ ]]
+          oidc_token=$(curl --fail --silent --show-error --proto '=https' --max-time 20 \
+            --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=rubygems.org" | jq -er '.value')
+          printf '::add-mask::%s\n' "$oidc_token"
+          gem_key=$(jq -cn --arg jwt "$oidc_token" --arg owner "$RUBYGEMS_OWNER_ID" '{jwt: $jwt, owner: $owner}' \
+            | curl --fail --silent --show-error --proto '=https' --max-time 20 \
+                --header 'Content-Type: application/json' --header 'Accept: application/json' --data-binary @- \
+                https://rubygems.org/api/v1/oidc/trusted_publisher/exchange_token \
+            | jq -er '.rubygems_api_key')
+          printf '::add-mask::%s\n' "$gem_key"
+          GEM_HOST_API_KEY="$gem_key" gem push sooner-email-0.1.0.gem
