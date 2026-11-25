@@ -1,3 +1,10 @@
+import { SoonerApiError, SoonerError, SoonerTransportError } from "./errors.js";
+import { Webhooks } from "./webhooks.js";
+
+export { SoonerApiError, SoonerError, SoonerTransportError, SoonerWebhookVerificationError } from "./errors.js";
+export type { TransportErrorCode } from "./errors.js";
+export * from "./webhooks.js";
+
 const DEFAULT_ORIGIN = "https://api.sooner.dev";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -69,10 +76,16 @@ export interface EmailPage {
 
 export interface RequestOptions {
   signal?: AbortSignal;
+  /** Override the client's `maxRetries` for this call. */
+  maxRetries?: number;
 }
 
 export interface SendOptions extends RequestOptions {
-  /** Reuse this key with the same payload if the request outcome is uncertain. */
+  /**
+   * Reuse this key with the same payload if the request outcome is uncertain.
+   * When retries are enabled and no key is given, the SDK generates one per call
+   * so its own retries can never send the email twice.
+   */
   idempotencyKey?: string;
 }
 
@@ -83,29 +96,21 @@ export interface ListOptions extends RequestOptions {
 
 export interface SoonerOptions {
   baseUrl?: string;
+  /** Deadline for each attempt, in milliseconds. Default 30000. */
   timeoutMs?: number;
+  /**
+   * Overall budget for one call across retries, in milliseconds. Default 60000.
+   * No retry starts once it would end past this budget, and retried attempts are
+   * cut short to fit it. The first attempt always gets the full `timeoutMs`.
+   */
+  totalTimeoutMs?: number;
   fetch?: typeof globalThis.fetch;
-}
-
-export class SoonerApiError extends Error {
-  override name = "SoonerApiError";
-
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly code: string,
-    readonly retryAfter?: string,
-  ) {
-    super(message);
-  }
-}
-
-export class SoonerTransportError extends Error {
-  override name = "SoonerTransportError";
-
-  constructor(message: string, readonly code: "timeout" | "aborted" | "network_error" | "invalid_response") {
-    super(message);
-  }
+  /** Retries after the first attempt for network errors, 429 and 5xx. Default 2. Set 0 to disable. */
+  maxRetries?: number;
+  /** First backoff ceiling in milliseconds. Default 500. Backoff doubles with full jitter. */
+  initialRetryDelayMs?: number;
+  /** Largest backoff in milliseconds. Default 8000. */
+  maxRetryDelayMs?: number;
 }
 
 function apiOrigin(value: string): string {
@@ -169,12 +174,77 @@ async function readJsonObject(response: Response): Promise<Record<string, unknow
   }
 }
 
+const DEFAULT_MAX_RETRIES = 2;
+const DEFAULT_INITIAL_RETRY_DELAY_MS = 500;
+const DEFAULT_MAX_RETRY_DELAY_MS = 8_000;
+const DEFAULT_TOTAL_TIMEOUT_MS = 60_000;
+/**
+ * A longer Retry-After is returned to the caller instead of waited out: the error
+ * keeps `retryable` and exposes `retryAfter`, so the caller decides when to retry.
+ */
+export const MAX_RETRY_AFTER_MS = 10_000;
+/** 429 names that do not clear within a retry window. */
+const QUOTA_ERRORS = new Set(["daily_quota_exceeded", "monthly_quota_exceeded"]);
+
+type Method = "GET" | "POST" | "PATCH";
+
+/** Whether an HTTP failure is transient. */
+function transientStatus(status: number, name: string): boolean {
+  if (status === 429) return !QUOTA_ERRORS.has(name);
+  if (status === 409) return name === "concurrent_idempotent_requests";
+  return status === 408 || status >= 500;
+}
+
+/** 429 and in-progress 409 responses are refused before any work, so any method may repeat them. */
+function refusedBeforeWork(status: number): boolean {
+  return status === 429 || status === 409;
+}
+
+/** Retry-After as milliseconds, from delta seconds or an HTTP date. */
+export function parseRetryAfter(value: string | null | undefined, now = Date.now()): number | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (/^\d+(\.\d+)?$/.test(trimmed)) return Math.ceil(Number(trimmed) * 1000);
+  const date = Date.parse(trimmed);
+  return Number.isFinite(date) ? Math.max(0, date - now) : null;
+}
+
+function nonNegativeInteger(value: number, name: string, max: number): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > max) {
+    throw new RangeError(`${name} must be an integer between 0 and ${max}.`);
+  }
+  return value;
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// Runtimes without RequestInit.cache support (older Cloudflare Workers compatibility
+// dates) reject the option while building the request, before anything is sent.
+let cacheOptionSupported = true;
+
 /** Server-side client. Keep project API keys out of browser bundles. */
 export class Sooner {
   readonly #origin: string;
   readonly #apiKey: string;
   readonly #timeoutMs: number;
+  readonly #totalTimeoutMs: number;
   readonly #fetch: typeof globalThis.fetch;
+  readonly #maxRetries: number;
+  readonly #initialRetryDelayMs: number;
+  readonly #maxRetryDelayMs: number;
 
   constructor(apiKey: string | undefined, options: SoonerOptions = {}) {
     if (typeof apiKey !== "string" || !API_KEY.test(apiKey)) {
@@ -187,19 +257,44 @@ export class Sooner {
     this.#origin = apiOrigin(options.baseUrl ?? DEFAULT_ORIGIN);
     this.#apiKey = apiKey;
     this.#timeoutMs = timeoutMs;
+    const totalTimeoutMs = options.totalTimeoutMs ?? DEFAULT_TOTAL_TIMEOUT_MS;
+    if (!Number.isSafeInteger(totalTimeoutMs) || totalTimeoutMs < 1 || totalTimeoutMs > 2_147_483_647) {
+      throw new RangeError("totalTimeoutMs must be a positive integer in milliseconds.");
+    }
+    this.#totalTimeoutMs = totalTimeoutMs;
     this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.#maxRetries = nonNegativeInteger(options.maxRetries ?? DEFAULT_MAX_RETRIES, "maxRetries", 10);
+    this.#initialRetryDelayMs = nonNegativeInteger(options.initialRetryDelayMs ?? DEFAULT_INITIAL_RETRY_DELAY_MS, "initialRetryDelayMs", 60_000);
+    this.#maxRetryDelayMs = nonNegativeInteger(options.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS, "maxRetryDelayMs", 300_000);
   }
 
-  readonly emails = {
-    send: (payload: SendEmail, options?: SendOptions) =>
-      this.#request<EmailId>("POST", "/emails", hasEmailId, options, payload),
+  /** Verify signed webhook requests. Works without network access. */
+  readonly webhooks = new Webhooks();
 
-    sendBatch: (payload: readonly BatchEmail[], options?: SendOptions) =>
+  /** Publish app notifications and issue short-lived feed credentials from your server. */
+  readonly inApp = {
+    publish: async (
+      notification: { user_id: string; title: string; body?: string; href?: string },
+      options: RequestOptions & { idempotencyKey: string },
+    ): Promise<{ id: string }> =>
+      this.#request("POST", "/in-app/notifications", (data) => typeof data.id === "string", options, notification),
+
+    createSession: async (userId: string, options?: RequestOptions): Promise<{ token: string; expires_at: string }> =>
+      this.#request("POST", "/in-app/sessions", (data) =>
+        typeof data.token === "string" && typeof data.expires_at === "string", options, { user_id: userId }),
+  };
+
+  readonly emails = {
+    // Methods are async so invalid arguments reject the returned promise instead of throwing.
+    send: async (payload: SendEmail, options?: SendOptions): Promise<EmailId> =>
+      this.#request<EmailId>("POST", "/emails", hasEmailId, this.#withIdempotency(options), payload),
+
+    sendBatch: async (payload: readonly BatchEmail[], options?: SendOptions): Promise<{ data: EmailId[] }> =>
       this.#request<{ data: EmailId[] }>("POST", "/emails/batch", (data) =>
         Array.isArray(data.data) && data.data.length === payload.length && data.data.every(hasEmailId),
-      options, payload),
+      this.#withIdempotency(options), payload),
 
-    list: (options: ListOptions = {}) => {
+    list: async (options: ListOptions = {}): Promise<EmailPage> => {
       const query = new URLSearchParams();
       if (options.limit !== undefined) query.set("limit", String(options.limit));
       if (options.after !== undefined) query.set("after", options.after);
@@ -209,58 +304,139 @@ export class Sooner {
       options);
     },
 
-    get: (id: string, options?: RequestOptions) =>
+    get: async (id: string, options?: RequestOptions): Promise<Email> =>
       this.#request<Email>("GET", emailPath(id), hasEmailObject, options),
 
-    reschedule: (id: string, scheduledAt: string, options?: RequestOptions) =>
+    reschedule: async (id: string, scheduledAt: string, options?: RequestOptions): Promise<EmailMutation> =>
       this.#request<EmailMutation>("PATCH", emailPath(id), hasEmailObject, options, { scheduled_at: scheduledAt }),
 
-    cancel: (id: string, options?: RequestOptions) =>
+    cancel: async (id: string, options?: RequestOptions): Promise<EmailMutation> =>
       this.#request<EmailMutation>("POST", `${emailPath(id)}/cancel`, hasEmailObject, options),
   };
 
+  #retries(options: RequestOptions = {}): number {
+    return options.maxRetries === undefined ? this.#maxRetries : nonNegativeInteger(options.maxRetries, "maxRetries", 10);
+  }
+
+  /** Sends get a generated key when retries are on, so a retry can only replay the original result. */
+  #withIdempotency(options: SendOptions = {}): SendOptions {
+    if (options.idempotencyKey !== undefined || this.#retries(options) === 0) return options;
+    return { ...options, idempotencyKey: `sooner-sdk-${crypto.randomUUID()}` };
+  }
+
+  #backoff(retry: number): number {
+    const ceiling = Math.min(this.#maxRetryDelayMs, this.#initialRetryDelayMs * 2 ** retry);
+    return Math.floor(Math.random() * ceiling);
+  }
+
   async #request<T>(
-    method: "GET" | "POST" | "PATCH",
+    method: Method,
     path: string,
     validate: (data: Record<string, unknown>) => boolean,
     options: SendOptions = {},
     payload?: unknown,
   ): Promise<T> {
+    const maxRetries = this.#retries(options);
+    const body = payload === undefined ? undefined : JSON.stringify(payload);
+    // Without a key, a POST or PATCH that may have reached the API is never repeated.
+    const replaySafe = method === "GET" || options.idempotencyKey !== undefined;
+    const deadlineAt = Date.now() + this.#totalTimeoutMs;
+    for (let attempt = 0; ; attempt++) {
+      let error: SoonerError;
+      try {
+        const timeoutMs = attempt === 0 ? this.#timeoutMs : Math.max(1, Math.min(this.#timeoutMs, deadlineAt - Date.now()));
+        return await this.#attempt<T>(method, path, validate, options, body, timeoutMs);
+      } catch (caught) {
+        error = caught as SoonerError;
+      }
+      if (attempt >= maxRetries || !error.retryable) throw error;
+      let delay: number;
+      if (error instanceof SoonerApiError) {
+        if (!replaySafe && !refusedBeforeWork(error.status)) throw error;
+        const retryAfter = parseRetryAfter(error.retryAfter);
+        if (retryAfter !== null && retryAfter > MAX_RETRY_AFTER_MS) throw error;
+        delay = retryAfter ?? this.#backoff(attempt);
+      } else {
+        if (!replaySafe) throw error;
+        delay = this.#backoff(attempt);
+      }
+      // Leave room for the retry itself; otherwise hand the last error back now.
+      if (Date.now() + delay >= deadlineAt) throw error;
+      try {
+        await sleep(delay, options.signal);
+      } catch {
+        throw new SoonerTransportError("The Sooner request was canceled.", "aborted", {
+          idempotencyKey: options.idempotencyKey ?? null,
+        });
+      }
+    }
+  }
+
+  async #attempt<T>(
+    method: Method,
+    path: string,
+    validate: (data: Record<string, unknown>) => boolean,
+    options: SendOptions,
+    body: string | undefined,
+    timeoutMs: number,
+  ): Promise<T> {
     const headers = new Headers({
       accept: "application/json",
       authorization: `Bearer ${this.#apiKey}`,
     });
-    const body = payload === undefined ? undefined : JSON.stringify(payload);
     if (body !== undefined) headers.set("content-type", "application/json");
     if (options.idempotencyKey !== undefined) headers.set("idempotency-key", options.idempotencyKey);
 
-    const deadline = AbortSignal.timeout(this.#timeoutMs);
+    const idempotencyKey = options.idempotencyKey ?? null;
+    const deadline = AbortSignal.timeout(timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
     try {
-      const response = await this.#fetch(this.#origin + path, {
-        method, headers, body, signal, redirect: "error", cache: "no-store",
-      });
+      const init: RequestInit = { method, headers, body, signal, redirect: "error" };
+      let response: Response;
+      if (cacheOptionSupported) {
+        try {
+          response = await this.#fetch(this.#origin + path, { ...init, cache: "no-store" });
+        } catch (error) {
+          if (!(error instanceof TypeError && /\bcache\b/i.test(error.message))) throw error;
+          cacheOptionSupported = false;
+          response = await this.#fetch(this.#origin + path, init);
+        }
+      } else {
+        response = await this.#fetch(this.#origin + path, init);
+      }
       const data = await readJsonObject(response);
+      const redact = (value: string) => value.replaceAll(this.#apiKey, "[redacted]");
+      const requestId = response.headers.get("x-request-id") ?? response.headers.get("request-id");
 
       if (!response.ok) {
-        const redact = (value: string) => value.replaceAll(this.#apiKey, "[redacted]");
         const retryAfter = response.headers.get("retry-after");
+        const name = typeof data?.name === "string" ? redact(data.name) : "unexpected_http_error";
         throw new SoonerApiError(
           typeof data?.message === "string" ? redact(data.message) : `Sooner returned HTTP ${response.status}.`,
           response.status,
-          typeof data?.name === "string" ? redact(data.name) : "unexpected_http_error",
+          name,
           retryAfter === null ? undefined : redact(retryAfter),
+          {
+            requestId: requestId === null ? null : redact(requestId),
+            retryable: transientStatus(response.status, name),
+            idempotencyKey,
+          },
         );
       }
       if (!data || !validate(data)) {
-        throw new SoonerTransportError("Sooner returned an invalid or oversized response.", "invalid_response");
+        throw new SoonerTransportError("Sooner returned an invalid or oversized response.", "invalid_response", {
+          statusCode: response.status,
+          requestId: requestId === null ? null : redact(requestId),
+          idempotencyKey,
+        });
       }
       return data as T;
     } catch (error) {
-      if (error instanceof SoonerApiError || error instanceof SoonerTransportError) throw error;
-      if (options.signal?.aborted) throw new SoonerTransportError("The Sooner request was canceled.", "aborted");
-      if (deadline.aborted) throw new SoonerTransportError("The Sooner request timed out.", "timeout");
-      throw new SoonerTransportError("Could not complete the request to Sooner.", "network_error");
+      if (error instanceof SoonerError) throw error;
+      const extra = { idempotencyKey };
+      if (options.signal?.aborted) throw new SoonerTransportError("The Sooner request was canceled.", "aborted", extra);
+      if (deadline.aborted) throw new SoonerTransportError("The Sooner request timed out.", "timeout", extra);
+      throw new SoonerTransportError("Could not complete the request to Sooner.", "network_error", extra);
     }
   }
 }

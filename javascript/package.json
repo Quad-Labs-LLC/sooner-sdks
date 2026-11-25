@@ -1,6 +1,6 @@
 {
   "name": "sooner-email",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Official JavaScript and TypeScript client for the Sooner email API",
   "type": "module",
   "license": "MIT",
@@ -17,9 +17,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./in-app": {
+      "types": "./dist/in-app.d.ts",
+      "default": "./dist/in-app.js"
     }
   },
   "types": "./dist/index.d.ts",
+  "sideEffects": false,
   "files": ["dist", "LICENSE"],
   "scripts": {
     "build": "tsc -p tsconfig.json",

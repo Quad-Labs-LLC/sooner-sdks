@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test } from "node:test";
-import { Sooner, SoonerApiError, SoonerTransportError } from "../dist/index.js";
+import { Sooner, SoonerApiError, SoonerError, SoonerTransportError } from "../dist/index.js";
 
 const apiKey = "sn_synthetic_test_key";
 const emailId = "01jcz8w3f2x9k4m7n6p5q2r1s0";
@@ -10,6 +10,7 @@ const message = { from: "sender@example.com", to: ["reader@example.com"], subjec
 test("uses the public API contract for send, batch, reads, reschedule and cancel", async () => {
   const calls = [];
   const client = new Sooner(apiKey, {
+    maxRetries: 0,
     fetch: async (url, options) => {
       calls.push({
         method: options.method,
@@ -47,11 +48,13 @@ test("uses the public API contract for send, batch, reads, reschedule and cancel
   ]);
 });
 
-test("reports a quota error with Retry-After and does not retry a send", async () => {
+test("reports a quota error with Retry-After and does not retry when retries are off", async () => {
   let calls = 0;
   const client = new Sooner(apiKey, {
-    fetch: async () => {
+    maxRetries: 0,
+    fetch: async (_url, options) => {
       calls++;
+      assert.equal(options.headers.get("idempotency-key"), null);
       return Response.json({ name: "rate_limit_exceeded", message: "Try later" }, {
         status: 429,
         headers: { "Retry-After": "2" },
@@ -59,7 +62,9 @@ test("reports a quota error with Retry-After and does not retry a send", async (
     },
   });
   await assert.rejects(client.emails.send(message), error =>
-    error instanceof SoonerApiError && error.status === 429 && error.code === "rate_limit_exceeded" && error.retryAfter === "2",
+    error instanceof SoonerApiError && error instanceof SoonerError && error.status === 429 &&
+    error.statusCode === 429 && error.code === "rate_limit_exceeded" && error.name === "rate_limit_exceeded" &&
+    error.retryAfter === "2" && error.retryable === true,
   );
   assert.equal(calls, 1);
 });
@@ -80,15 +85,15 @@ test("keeps the API key on the configured origin and applies a request deadline"
     server.closeAllConnections();
   });
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
-  await assert.rejects(new Sooner(apiKey, { baseUrl }).emails.send(message), { code: "network_error" });
+  await assert.rejects(new Sooner(apiKey, { baseUrl, maxRetries: 0 }).emails.send(message), { code: "network_error" });
   assert.equal(receivedRedirect, false);
-  await assert.rejects(new Sooner(apiKey, { baseUrl, timeoutMs: 25 }).emails.get(emailId), { code: "timeout" });
+  await assert.rejects(new Sooner(apiKey, { baseUrl, timeoutMs: 25, maxRetries: 0 }).emails.get(emailId), { code: "timeout" });
 });
 
 test("rejects invalid IDs and unexpected success bodies", async () => {
   assert.throws(() => new Sooner(apiKey, { baseUrl: "http://example.com" }), TypeError);
   const client = new Sooner(apiKey, { fetch: async () => new Response("<html>") });
-  assert.throws(() => client.emails.get("../emails"), TypeError);
+  await assert.rejects(client.emails.get("../emails"), TypeError);
   await assert.rejects(client.emails.list(), error =>
     error instanceof SoonerTransportError && error.code === "invalid_response",
   );
@@ -101,6 +106,7 @@ test("caps response bodies and redacts credentials from error details", async ()
   const client = new Sooner(apiKey, { fetch: async () => new Response(oversized) });
   await assert.rejects(client.emails.send(message), { code: "invalid_response" });
   const throttled = new Sooner(apiKey, {
+    maxRetries: 0,
     fetch: async () => new Response(oversized, { status: 429, headers: { "Retry-After": "5" } }),
   });
   await assert.rejects(throttled.emails.send(message), { status: 429, retryAfter: "5" });
